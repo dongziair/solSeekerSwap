@@ -391,12 +391,20 @@ async function executeSwap(connection, wallet, direction) {
 async function executeSwapPair(connection, wallet, pairIndex, totalPairs) {
     log(`\n━━━ 第 ${pairIndex}/${totalPairs} 对 ━━━`);
 
+    // SOL → USDT（最多重试 3 次）
     let buyOk = false;
-    try {
-        const tx1 = await executeSwap(connection, wallet, 'SOL_TO_USDT');
-        if (tx1) buyOk = true;
-    } catch (err) {
-        log(`❌ SOL→USDT 失败: ${err.message}`);
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            const tx1 = await executeSwap(connection, wallet, 'SOL_TO_USDT');
+            if (tx1) { buyOk = true; break; }
+        } catch (err) {
+            log(`❌ SOL→USDT 失败 (${attempt}/3): ${err.message}`);
+            if (attempt < 3) {
+                const retryMs = randomInt(2000, 5000);
+                log(`🔄 ${(retryMs / 1000).toFixed(1)}s 后重试...`);
+                await sleep(retryMs);
+            }
+        }
     }
 
     if (!buyOk) return { success: 0, fail: 1 };
@@ -405,13 +413,21 @@ async function executeSwapPair(connection, wallet, pairIndex, totalPairs) {
     log(`⏳ 查看结果... ${gapSeconds}s`);
     await sleep(gapSeconds * 1000);
 
-    try {
-        await executeSwap(connection, wallet, 'USDT_TO_SOL');
-        return { success: 2, fail: 0 };
-    } catch (err) {
-        log(`❌ USDT→SOL 失败: ${err.message}`);
-        return { success: 1, fail: 1 };
+    // USDT → SOL（最多重试 3 次）
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            await executeSwap(connection, wallet, 'USDT_TO_SOL');
+            return { success: 2, fail: 0 };
+        } catch (err) {
+            log(`❌ USDT→SOL 失败 (${attempt}/3): ${err.message}`);
+            if (attempt < 3) {
+                const retryMs = randomInt(2000, 5000);
+                log(`🔄 ${(retryMs / 1000).toFixed(1)}s 后重试...`);
+                await sleep(retryMs);
+            }
+        }
     }
+    return { success: 1, fail: 1 };
 }
 
 // ==================== 主循环 ====================
