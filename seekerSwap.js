@@ -9,6 +9,16 @@ const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const USDT_MINT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
 const USDT_DECIMALS = 6;
 
+// SKR 质押常量
+const SKR_MINT = new PublicKey('SKRbvo6Gf7GondiT3BbTfuRDPqLWei4j2Qy2NPGZhW3');
+const SKR_DECIMALS = 6;
+const STAKING_PROGRAM_ID = new PublicKey('SKRskrmtL83pcL4YqLWt6iPefDqwXQWHSw9S9vz94BZ');
+const STAKE_CONFIG = new PublicKey('4HQy82s9CHTv1GsYKnANHMiHfhcqesYkK6sB3RDSYyqw');
+const GUARDIAN_POOL = new PublicKey('DPJ58trLsF9yPrBa2pk6UaRkvqW8hWUYjawe788WBuqr');
+const STAKE_VAULT = new PublicKey('8isViKbwhuhFhsv2t8vaFL74pKCqaFPQXo1KkeQwZbB8');
+const EVENT_AUTHORITY = new PublicKey('8rUTGg1XoyuvK9G64S7d37m3HtLZH24oPeMmXkpJH8ir');
+const STAKE_DISCRIMINATOR = Buffer.from('ceb0ca12c8d1b36c', 'hex');
+
 // Seeker / DFlow 平台费参数
 const SEEKER_PLATFORM_FEE_BPS = 82;
 const SEEKER_FEE_ACCOUNT = '2rbMgYvzAb3xDk6vXrzKkY3VwsmyDZsJTkvB3JJYsRzA';
@@ -36,6 +46,10 @@ const DAILY_SWAP_MIN = parseInt(process.env.DAILY_SWAP_MIN) || 100;
 const DAILY_SWAP_MAX = parseInt(process.env.DAILY_SWAP_MAX) || 150;
 const SWAP_AMOUNT_SOL_MIN = parseFloat(process.env.SWAP_AMOUNT_SOL_MIN) || 0.001;
 const SWAP_AMOUNT_SOL_MAX = parseFloat(process.env.SWAP_AMOUNT_SOL_MAX) || 0.005;
+const DAILY_STAKE_MIN = parseInt(process.env.DAILY_STAKE_MIN) || 30;
+const DAILY_STAKE_MAX = parseInt(process.env.DAILY_STAKE_MAX) || 50;
+const STAKE_AMOUNT_SKR_MIN = parseInt(process.env.STAKE_AMOUNT_SKR_MIN) || 1;
+const STAKE_AMOUNT_SKR_MAX = parseInt(process.env.STAKE_AMOUNT_SKR_MAX) || 5;
 
 const DFLOW_BASE_URL = DFLOW_API_KEY
     ? 'https://quote-api.dflow.net'
@@ -337,6 +351,121 @@ async function getUsdtBalance(connection, publicKey) {
     return 0;
 }
 
+// ==================== 查询 SKR 余额 ====================
+
+async function getSkrBalance(connection, publicKey) {
+    const accounts = await connection.getParsedTokenAccountsByOwner(
+        publicKey,
+        { mint: SKR_MINT }
+    );
+    for (const acc of accounts.value) {
+        const info = acc.account.data.parsed.info;
+        if (info.mint === SKR_MINT.toBase58()) {
+            return parseFloat(info.tokenAmount.uiAmount);
+        }
+    }
+    return 0;
+}
+
+// ==================== 执行 SKR 质押 ====================
+
+async function executeStake(connection, wallet, skrAmount) {
+    const { TransactionMessage, TransactionInstruction, ComputeBudgetProgram, SystemProgram } = require('@solana/web3.js');
+    const { getAssociatedTokenAddressSync, TOKEN_PROGRAM_ID } = require('@solana/spl-token');
+
+    const amountLamports = BigInt(skrAmount) * BigInt(Math.pow(10, SKR_DECIMALS));
+    const amountBuf = Buffer.alloc(8);
+    amountBuf.writeBigUInt64LE(amountLamports);
+
+    const instructionData = Buffer.concat([STAKE_DISCRIMINATOR, amountBuf]);
+
+    const [userStakePda] = PublicKey.findProgramAddressSync(
+        [Buffer.from('user_stake'), STAKE_CONFIG.toBuffer(), wallet.publicKey.toBuffer(), GUARDIAN_POOL.toBuffer()],
+        STAKING_PROGRAM_ID,
+    );
+
+    const userTokenAccount = getAssociatedTokenAddressSync(SKR_MINT, wallet.publicKey);
+
+    const stakeIx = new TransactionInstruction({
+        programId: STAKING_PROGRAM_ID,
+        keys: [
+            { pubkey: userStakePda, isSigner: false, isWritable: true },
+            { pubkey: STAKE_CONFIG, isSigner: false, isWritable: true },
+            { pubkey: GUARDIAN_POOL, isSigner: false, isWritable: true },
+            { pubkey: wallet.publicKey, isSigner: true, isWritable: true },
+            { pubkey: wallet.publicKey, isSigner: true, isWritable: true },
+            { pubkey: userTokenAccount, isSigner: false, isWritable: true },
+            { pubkey: STAKE_VAULT, isSigner: false, isWritable: true },
+            { pubkey: SKR_MINT, isSigner: false, isWritable: true },
+            { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+            { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+            { pubkey: EVENT_AUTHORITY, isSigner: false, isWritable: false },
+            { pubkey: STAKING_PROGRAM_ID, isSigner: false, isWritable: false },
+        ],
+        data: instructionData,
+    });
+
+    const instructions = [
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 100_000 }),
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: COMPUTE_UNIT_PRICE_MICRO_LAMPORTS }),
+        stakeIx,
+    ];
+
+    const { blockhash } = await connection.getLatestBlockhash('confirmed');
+    const messageV0 = new TransactionMessage({
+        payerKey: wallet.publicKey,
+        recentBlockhash: blockhash,
+        instructions,
+    }).compileToV0Message();
+
+    const tx = new VersionedTransaction(messageV0);
+    tx.sign([wallet]);
+
+    const txHash = await connection.sendRawTransaction(tx.serialize(), {
+        skipPreflight: false,
+        maxRetries: 3,
+        preflightCommitment: 'confirmed',
+    });
+    return txHash;
+}
+
+// ==================== 执行单次质押（含余额检查和重试） ====================
+
+async function executeStakeWithCheck(connection, wallet) {
+    const skrAmount = randomInt(STAKE_AMOUNT_SKR_MIN, STAKE_AMOUNT_SKR_MAX);
+
+    const balance = await getSkrBalance(connection, wallet.publicKey);
+    if (balance < skrAmount) {
+        log(`⚠ SKR 余额不足 (${balance})，需要 ${skrAmount}，跳过质押`);
+        return null;
+    }
+
+    log(`🔒 质押 ${skrAmount} SKR`);
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            const txHash = await executeStake(connection, wallet, skrAmount);
+            log(`  ↳ 已发送: ${txHash}`);
+
+            const confirmation = await connection.confirmTransaction(txHash, 'confirmed');
+            if (confirmation.value.err) {
+                throw new Error(`链上失败: ${JSON.stringify(confirmation.value.err)}`);
+            }
+
+            log(`✅ 质押确认 | https://solscan.io/tx/${txHash}`);
+            return txHash;
+        } catch (err) {
+            log(`❌ 质押失败 (${attempt}/3): ${err.message}`);
+            if (attempt < 3) {
+                const retryMs = randomInt(2000, 5000);
+                log(`🔄 ${(retryMs / 1000).toFixed(1)}s 后重试...`);
+                await sleep(retryMs);
+            }
+        }
+    }
+    return null;
+}
+
 // ==================== 执行单次 Swap ====================
 
 async function executeSwap(connection, wallet, direction) {
@@ -442,11 +571,13 @@ async function main() {
     const connection = new Connection(RPC_URL, 'confirmed');
 
     log('═'.repeat(60));
-    log('🚀 Seeker 钱包自动 Swap 脚本启动');
+    log('🚀 Seeker 钱包自动 Swap + 质押脚本启动');
     log(`📍 钱包: ${wallet.publicKey.toBase58()}`);
     log(`🌐 RPC: ${RPC_URL}`);
-    log(`📊 每日交互: ${DAILY_SWAP_MIN}-${DAILY_SWAP_MAX} 次`);
-    log(`💰 金额: ${SWAP_AMOUNT_SOL_MIN}-${SWAP_AMOUNT_SOL_MAX} SOL`);
+    log(`📊 每日 Swap: ${DAILY_SWAP_MIN}-${DAILY_SWAP_MAX} 次`);
+    log(`💰 Swap 金额: ${SWAP_AMOUNT_SOL_MIN}-${SWAP_AMOUNT_SOL_MAX} SOL`);
+    log(`🔒 每日质押: ${DAILY_STAKE_MIN}-${DAILY_STAKE_MAX} 次`);
+    log(`🪙 质押金额: ${STAKE_AMOUNT_SKR_MIN}-${STAKE_AMOUNT_SKR_MAX} SKR`);
     log(`🕐 活跃: ${ACTIVE_HOUR_START}:00 - ${ACTIVE_HOUR_END}:00 (UTC+8)`);
     log('─'.repeat(60));
     log(`🔗 DFlow: ${HAS_DFLOW ? '✅ 可用' : '❌ 不可用'} (${DFLOW_BASE_URL})`);
@@ -458,6 +589,8 @@ async function main() {
     log(`💰 SOL: ${(balance / LAMPORTS_PER_SOL).toFixed(6)}`);
     const usdtBal = await getUsdtBalance(connection, wallet.publicKey);
     log(`💵 USDT: ${usdtBal.toFixed(6)}`);
+    const skrBal = await getSkrBalance(connection, wallet.publicKey);
+    log(`🪙 SKR: ${skrBal.toFixed(6)}`);
 
     while (true) {
         if (!isActiveTime()) {
@@ -469,29 +602,51 @@ async function main() {
 
         const dailySwapCount = randomInt(DAILY_SWAP_MIN, DAILY_SWAP_MAX);
         const totalPairs = Math.ceil(dailySwapCount / 2);
-        log(`\n📅 今日: ${totalPairs} 对 swap（${totalPairs * 2} 次交互）`);
+        const dailyStakeCount = randomInt(DAILY_STAKE_MIN, DAILY_STAKE_MAX);
+        log(`\n📅 今日: ${totalPairs} 对 swap（${totalPairs * 2} 次交互）+ ${dailyStakeCount} 次质押`);
+
+        // 生成混合任务队列：swap 对 + 质押操作
+        const tasks = [];
+        for (let i = 0; i < totalPairs; i++) tasks.push('swap');
+        for (let i = 0; i < dailyStakeCount; i++) tasks.push('stake');
+        // 随机打乱顺序
+        for (let i = tasks.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [tasks[i], tasks[j]] = [tasks[j], tasks[i]];
+        }
 
         const activeHours = ACTIVE_HOUR_END - ACTIVE_HOUR_START;
         const activeSeconds = activeHours * 3600;
-        const avgPairIntervalMs = (activeSeconds / totalPairs) * 1000;
+        const avgIntervalMs = (activeSeconds / tasks.length) * 1000;
 
-        let totalSuccess = 0;
-        let totalFail = 0;
+        let swapSuccess = 0, swapFail = 0;
+        let stakeSuccess = 0, stakeSkip = 0, stakeFail = 0;
+        let swapIdx = 0;
 
-        for (let i = 1; i <= totalPairs; i++) {
+        for (let i = 0; i < tasks.length; i++) {
             if (!isActiveTime()) {
                 log(`⏰ 已过活跃时段，今日结束`);
                 break;
             }
 
-            const result = await executeSwapPair(connection, wallet, i, totalPairs);
-            totalSuccess += result.success;
-            totalFail += result.fail;
+            if (tasks[i] === 'swap') {
+                swapIdx++;
+                const result = await executeSwapPair(connection, wallet, swapIdx, totalPairs);
+                swapSuccess += result.success;
+                swapFail += result.fail;
+            } else {
+                const result = await executeStakeWithCheck(connection, wallet);
+                if (result === null) {
+                    stakeSkip++;
+                } else {
+                    stakeSuccess++;
+                }
+            }
 
-            log(`📈 成功 ${totalSuccess} | 失败 ${totalFail} | 剩余 ${totalPairs - i} 对`);
+            log(`📈 Swap 成功 ${swapSuccess}/失败 ${swapFail} | 质押 成功 ${stakeSuccess}/跳过 ${stakeSkip} | 剩余 ${tasks.length - i - 1}`);
 
-            if (i < totalPairs) {
-                const waitMs = Math.floor(avgPairIntervalMs * randomFloat(0.3, 1.7));
+            if (i < tasks.length - 1) {
+                const waitMs = Math.floor(avgIntervalMs * randomFloat(0.3, 1.7));
                 const waitMin = (waitMs / 60000).toFixed(1);
                 log(`⏳ 休息 ${waitMin} 分钟...`);
                 await sleep(waitMs);
@@ -499,7 +654,7 @@ async function main() {
         }
 
         log('\n' + '═'.repeat(60));
-        log(`📊 今日汇总: 成功 ${totalSuccess} | 失败 ${totalFail}`);
+        log(`📊 今日汇总: Swap 成功 ${swapSuccess}/失败 ${swapFail} | 质押 成功 ${stakeSuccess}/跳过 ${stakeSkip}`);
         log('═'.repeat(60));
 
         const waitMs = msUntilActiveStart();
